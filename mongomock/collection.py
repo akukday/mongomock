@@ -4,11 +4,15 @@ import functools
 import itertools
 import json
 import time
-import warnings
 from sentinels import NOTHING
 from .filtering import filter_applies, resolve_key_value
 from . import ObjectId, OperationFailure, DuplicateKeyError
-from .helpers import basestring
+from .helpers import basestring, mimic_async
+import logging
+import log as log_helpers
+
+log = logging.getLogger(__name__)
+log_helpers.enable_pretty_logging('INFO', log)
 
 try:
     # Optional requirements for providing Map-Reduce functionality
@@ -27,7 +31,6 @@ from six import (
     iteritems,
     itervalues,
     iterkeys)
-from mongomock import helpers
 
 
 class Collection(object):
@@ -47,13 +50,15 @@ class Collection(object):
     def __getattr__(self, name):
         return self.__getitem__(name)
 
-    def insert(self, data):
+    @mimic_async
+    def insert(self, data, *ingored_args, **ignored_kwargs):
+        log.info("%s:%s enter insert(self, data) %s", id(self), self, id(data))
         if isinstance(data, list):
             return [self._insert(element) for element in data]
         return self._insert(data)
 
     def _insert(self, data):
-
+        log.info("%s:%s enter _insert doc:%s to local place", id(self), self, data)
         if not all(isinstance(k, string_types) for k in data):
             raise ValueError("Document keys must be strings")
 
@@ -71,6 +76,7 @@ class Collection(object):
     def _has_key(self, doc, key):
         return key in doc
 
+    @mimic_async
     def update(self, spec, document, upsert = False, manipulate = False,
                safe = False, multi = False, _check_keys = False, **kwargs):
         """Updates document(s) in the collection."""
@@ -203,7 +209,7 @@ class Collection(object):
                 first = False
             if not multi:
                 break
-
+        log.info("%s:%s updated spec:%s, doc:%s", id(self), self, spec, document)
         return {
             text_type("connectionId"): self._Collection__database.connection._id,
             text_type("err"): None,
@@ -253,14 +259,22 @@ class Collection(object):
         # TODO: this looks a little too naive...
         return dict((k, v) for k, v in iteritems(doc) if not k.startswith("$"))
 
-    def find(self, spec = None, fields = None, filter = None, sort = None, timeout = True, limit = 0, snapshot = False, as_class = None):
+    @mimic_async
+    def find(self, spec = None, fields = None, filter = None, sort = None, timeout = True, limit = 0, snapshot = False, as_class = None, skip=None, cursor_only=False):
         if filter is not None:
             _print_deprecation_warning('filter', 'spec')
             if spec is None:
                 spec = filter
         if as_class is None:
             as_class = dict
-        return Cursor(self, functools.partial(self._get_dataset, spec, sort, fields, as_class), limit=limit)
+        log.info("%s:%s selected cursor spec:%s", id(self), self, spec)
+        cursor = Cursor(self, functools.partial(self._get_dataset, spec, sort, fields, as_class), limit=limit)
+        if cursor_only:
+            return cursor
+        if skip:
+            return [list(cursor.skip(skip))]
+        else:
+            return [list(cursor)]
 
     def _get_dataset(self, spec, sort, fields, as_class):
         dataset = (self._copy_only_fields(document, fields, as_class) for document in self._iter_documents(spec))
@@ -380,6 +394,7 @@ class Collection(object):
     def _iter_documents(self, filter = None):
         return (document for document in itervalues(self._documents) if filter_applies(filter, document))
 
+    @mimic_async
     def find_one(self, spec_or_id=None, *args, **kwargs):
         # Allow calling find_one with a non-dict argument that gets used as
         # the id for the query.
@@ -389,10 +404,11 @@ class Collection(object):
             spec_or_id = {'_id':spec_or_id}
 
         try:
-            return next(self.find(spec_or_id, *args, **kwargs))
+            return [next(iter(self.find(spec_or_id, *args, **kwargs)[0])), ]
         except StopIteration:
             return None
 
+    @mimic_async
     def find_and_modify(self, query = {}, update = None, upsert = False, **kwargs):
         remove = kwargs.get("remove", False)
         if kwargs.get("new", False) and remove:
@@ -414,20 +430,23 @@ class Collection(object):
             self.update({'_id':old['_id']}, update)
 
         if kwargs.get('new', False):
-            return self.find_one({'_id':old['_id']})
+            return  self.find_one({'_id':old['_id']})
         return old
 
+    @mimic_async
     def save(self, to_save, manipulate = True, safe = False, **kwargs):
         if not isinstance(to_save, dict):
             raise TypeError("cannot save object of type %s" % type(to_save))
 
-        if "_id" not in to_save:
+        log.info("%s:%s saving:%s", id(self), self, to_save)
+        if "_id" not in to_save or not (to_save["_id"] in self._documents):
             return self.insert(to_save)
         else:
             self.update({"_id": to_save["_id"]}, to_save, True,
                         manipulate, safe, _check_keys = True, **kwargs)
             return to_save.get("_id", None)
 
+    @mimic_async
     def remove(self, spec_or_id = None, search_filter = None):
         """Remove objects matching spec_or_id from the collection."""
         if search_filter is not None:
@@ -436,7 +455,7 @@ class Collection(object):
             spec_or_id = search_filter if search_filter else {}
         if not isinstance(spec_or_id, dict):
             spec_or_id = {'_id': spec_or_id}
-        to_delete = list(self.find(spec = spec_or_id))
+        to_delete = self.find(spec = spec_or_id)[0]
         for doc in to_delete:
             doc_id = doc['_id']
             del self._documents[doc_id]
@@ -448,9 +467,12 @@ class Collection(object):
             "err": None,
         }
 
+
+    @mimic_async
     def count(self):
         return len(self._documents)
 
+    @mimic_async
     def drop(self):
         del self._documents
         self._documents = {}
@@ -458,6 +480,7 @@ class Collection(object):
     def ensure_index(self, key_or_list, cache_for = 300, **kwargs):
         pass
 
+    @mimic_async
     def map_reduce(self, map_func, reduce_func, out, full_response=False, query=None, limit=0):
         if execjs is None:
             raise NotImplementedError(
@@ -540,11 +563,14 @@ class Collection(object):
             ret_val = full_dict
         return ret_val
 
+    @mimic_async
     def inline_map_reduce(self, map_func, reduce_func, full_response=False, query=None, limit=0):
         return self.map_reduce(map_func, reduce_func, {'inline':1}, full_response, query, limit)
 
+    @mimic_async
     def distinct(self, key):
         return self.find().distinct(key)
+
 
 
 class Cursor(object):
@@ -573,6 +599,7 @@ class Cursor(object):
             self._limit -= 1
         return next(self._dataset)
     next = __next__
+
     def sort(self, key_or_list, direction = None):
         if direction is None:
             direction = 1
@@ -582,17 +609,22 @@ class Cursor(object):
         else:
             self._dataset = iter(sorted(self._dataset, key = lambda x:resolve_key_value(key_or_list, x), reverse = direction < 0))
         return self
+
+    @mimic_async
     def count(self):
         arr = [x for x in self._dataset]
         count = len(arr)
         self._dataset = iter(arr)
         return count
+
     def skip(self, count):
         self._skip = count
         return self
+
     def limit(self, count):
         self._limit = count
         return self
+
     def batch_size(self, count):
         return self
 

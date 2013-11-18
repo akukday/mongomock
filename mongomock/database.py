@@ -1,4 +1,5 @@
 from .collection import Collection
+from .helpers import mimic_async
 
 class Database(object):
     def __init__(self, conn, name):
@@ -23,6 +24,7 @@ class Database(object):
     def connection(self):
         return self._Database__connection
 
+    @mimic_async
     def collection_names(self, include_system_collections=True):
         if include_system_collections:
             return list(self._collections.keys())
@@ -34,6 +36,7 @@ class Database(object):
 
         return result
 
+    @mimic_async
     def drop_collection(self, name_or_collection):
         try:
             # FIXME a better way to remove an entry by value ?
@@ -45,3 +48,12 @@ class Database(object):
                 del self._collections[name_or_collection]
         except:  # EAFP paradigm (http://en.m.wikipedia.org/wiki/Python_syntax_and_semantics)
             pass
+
+    @mimic_async
+    def command(self, cmd):
+        if "count" in cmd:
+            coll = cmd["count"]
+            if "query" in cmd:
+                return [dict(n=self[coll].find(cmd["query"]).count())]
+            else:
+                return [dict(n=self[coll].count())]
